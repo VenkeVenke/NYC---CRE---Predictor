@@ -58,30 +58,40 @@ PRODUCTION_ALIAS      = "production"
 # ---------------------------------------------------------------------------
 
 FEATURE_COLS = [
-    "borough",
-    "zip_code",
-    "gross_square_feet",
-    "land_square_feet",
-    "year_built",
-    "building_age",
-    "commercial_units",
-    "residential_units",
-    "has_commercial_units",
-    "building_class_code",
-    "sale_year",
+    "borough",              # category: 1–5
+    "zip_code",             # category: ~170 NYC zip codes
+    "gross_square_feet",    # continuous: total building area
+    "land_square_feet",     # continuous: land area
+    "building_age",         # continuous: years old at sale (replaces year_built)
+    "commercial_units",     # continuous: number of commercial units
+    "residential_units",    # continuous: number of residential units
+    "has_commercial_units", # binary flag
+    "building_class_code",  # category: 0–7 building types
+    "neighborhood_code",    # category: 0–237 NYC neighborhoods
+    "sale_year",            # continuous: year of sale
+    "sale_month",           # continuous: month of sale (1–12) — seasonality
+    "floor_area_ratio",     # continuous: gross_sqft / land_sqft — building density
+    "log_gross_sqft",       # continuous: log1p(gross_sqft) — explicit size scale
+    "total_units",          # continuous: commercial + residential units
+    "is_manhattan",         # binary: borough == 1 — Manhattan premium
 ]
+
+# Columns treated as categories — XGBoost will NOT assume numeric ordering
+CATEGORICAL_COLS = ["borough", "zip_code", "building_class_code", "neighborhood_code"]
 
 TARGET_COL = "sale_price"
 
-# XGBoost hyperparameters — defined once so we can log them to MLflow easily
+# XGBoost hyperparameters
 PARAMS = {
-    "n_estimators":     500,
-    "max_depth":        6,
-    "learning_rate":    0.05,
-    "subsample":        0.8,
-    "colsample_bytree": 0.8,
-    "random_state":     42,
-    "n_jobs":           -1,
+    "n_estimators":       500,
+    "max_depth":          6,
+    "learning_rate":      0.05,
+    "subsample":          0.8,
+    "colsample_bytree":   0.8,
+    "enable_categorical": True,   # correct splits for borough, zip, neighborhood
+    "tree_method":        "hist", # required when enable_categorical=True
+    "random_state":       42,
+    "n_jobs":             -1,
 }
 
 
@@ -89,18 +99,37 @@ PARAMS = {
 # Step 1 — Load data
 # ---------------------------------------------------------------------------
 
+def apply_categorical_dtypes(X: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert CATEGORICAL_COLS to pandas 'category' dtype.
+
+    Why this matters:
+        CSV loading reads all integers as int64. XGBoost would treat
+        zip_code=10001 as a number smaller than zip_code=10002.
+        Setting dtype='category' tells XGBoost to treat each value as
+        its own bucket — no ordering assumed. This is critical for zip_code
+        and neighborhood_code where numeric order is meaningless.
+    """
+    X = X.copy()
+    for col in CATEGORICAL_COLS:
+        if col in X.columns:
+            X[col] = X[col].astype("category")
+    return X
+
+
 def load_data() -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series]:
     print("Loading processed data...")
     train = pd.read_csv(TRAIN_FILE)
     test  = pd.read_csv(TEST_FILE)
-    print(f"  Train: {len(train):,} rows")
-    print(f"  Test:  {len(test):,} rows")
+    print(f"  Train: {len(train):,} rows  (2022–2023)")
+    print(f"  Test:  {len(test):,} rows  (2024)")
 
-    X_train = train[FEATURE_COLS]
+    X_train = apply_categorical_dtypes(train[FEATURE_COLS])
     y_train = train[TARGET_COL]
-    X_test  = test[FEATURE_COLS]
+    X_test  = apply_categorical_dtypes(test[FEATURE_COLS])
     y_test  = test[TARGET_COL]
 
+    print(f"  Categorical columns: {CATEGORICAL_COLS}")
     return X_train, y_train, X_test, y_test
 
 
@@ -278,6 +307,38 @@ def log_to_mlflow(
 
 
 # ---------------------------------------------------------------------------
+# Step 6 — Baseline comparison
+# ---------------------------------------------------------------------------
+
+def compute_baseline(y_train: pd.Series, y_test: pd.Series) -> dict[str, float]:
+    """
+    Dumb baseline: predict the median training sale_price for every property.
+
+    This is the minimum bar the model must beat. If XGBoost can't outperform
+    'just guess the median', then our features are useless or something is broken.
+
+    R² of the baseline is always 0 or negative — the model should be much higher.
+    """
+    median_pred = float(y_train.median())
+    preds = np.full(len(y_test), median_pred)
+
+    rmse = float(np.sqrt(mean_squared_error(y_test, preds)))
+    mae  = float(mean_absolute_error(y_test, preds))
+    r2   = float(r2_score(y_test, preds))
+
+    print("\n" + "=" * 50)
+    print("BASELINE (predict training median for everything)")
+    print("=" * 50)
+    print(f"  Median prediction : ${median_pred:,.0f}")
+    print(f"  RMSE : ${rmse:>15,.0f}")
+    print(f"  MAE  : ${mae:>15,.0f}")
+    print(f"  R²   : {r2:>16.4f}")
+    print("=" * 50)
+
+    return {"baseline_rmse": rmse, "baseline_mae": mae, "baseline_r2": r2}
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -287,14 +348,32 @@ def main() -> None:
     print("=" * 60)
 
     X_train, y_train, X_test, y_test = load_data()
+
+    # Step 0: baseline — sets the minimum bar for the model to beat
+    baseline_metrics = compute_baseline(y_train, y_test)
+
     model   = train_model(X_train, y_train)
     metrics = evaluate_model(model, X_test, y_test)
     print_feature_importance(model)
     save_model_locally(model)
-    run_id  = log_to_mlflow(model, metrics, X_train)
+
+    try:
+        run_id = log_to_mlflow(model, metrics, X_train)
+    except Exception as e:
+        print(f"\nMLflow logging skipped ({type(e).__name__}: {e})")
+        print("Model is saved locally. Start MLflow server and re-run to register.")
+        run_id = "N/A (MLflow offline)"
+
+    # Summary: how much did we beat the baseline?
+    rmse_lift = (baseline_metrics["baseline_rmse"] - metrics["rmse"]) / baseline_metrics["baseline_rmse"] * 100
+    mae_lift  = (baseline_metrics["baseline_mae"]  - metrics["mae"])  / baseline_metrics["baseline_mae"]  * 100
 
     print("\n" + "=" * 60)
-    print("COMPLETE")
+    print("MODEL vs BASELINE SUMMARY")
+    print("=" * 60)
+    print(f"  RMSE  : model ${metrics['rmse']:>12,.0f}  vs  baseline ${baseline_metrics['baseline_rmse']:>12,.0f}  ({rmse_lift:+.1f}%)")
+    print(f"  MAE   : model ${metrics['mae']:>12,.0f}  vs  baseline ${baseline_metrics['baseline_mae']:>12,.0f}  ({mae_lift:+.1f}%)")
+    print(f"  R²    : model {metrics['r2']:>13.4f}  vs  baseline {baseline_metrics['baseline_r2']:>13.4f}")
     print("=" * 60)
     print(f"\nMLflow UI : http://127.0.0.1:5000")
     print(f"Experiment: {MLFLOW_EXPERIMENT}")

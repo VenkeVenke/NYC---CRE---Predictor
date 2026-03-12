@@ -31,11 +31,13 @@ Test it:
     curl -X POST http://localhost:8000/predict \
          -H "Content-Type: application/json" \
          -d '{"borough":1,"zip_code":10001,"gross_square_feet":8500,
-              "land_square_feet":2000,"year_built":1962,"building_age":62,
+              "land_square_feet":2000,"building_age":62,
               "commercial_units":3,"residential_units":0,
-              "has_commercial_units":1,"building_class_code":1,"sale_year":2024}'
+              "has_commercial_units":1,"building_class_code":1,
+              "neighborhood":"MIDTOWN WEST","sale_year":2024,"sale_month":6}'
 """
 
+import json
 import os
 import socket
 import numpy as np
@@ -61,9 +63,10 @@ MODEL_ALIAS         = os.getenv("MODEL_ALIAS",         "production")
 # We store the loaded model and its metadata here so every request
 # can use it without reloading from MLflow each time
 model_state: dict = {
-    "model":   None,
-    "version": None,
-    "alias":   MODEL_ALIAS,
+    "model":                 None,
+    "version":               None,
+    "alias":                 MODEL_ALIAS,
+    "neighborhood_encoding": {},   # neighborhood name → integer code
 }
 
 
@@ -72,6 +75,14 @@ model_state: dict = {
 # ---------------------------------------------------------------------------
 
 LOCAL_MODEL_FILE = os.getenv("LOCAL_MODEL_FILE", "/app/models/xgboost_model.joblib")
+
+# Neighborhood encoding file — resolves relative to this file so it works
+# both locally (src/serving/../../models/) and in Docker (/app/models/)
+_HERE = os.path.dirname(os.path.abspath(__file__))
+LOCAL_NEIGHBORHOOD_ENCODING_FILE = os.getenv(
+    "NEIGHBORHOOD_ENCODING_FILE",
+    os.path.normpath(os.path.join(_HERE, "..", "..", "models", "neighborhood_encoding.json")),
+)
 
 
 def load_production_model() -> None:
@@ -118,16 +129,24 @@ def load_production_model() -> None:
             model_state["version"] = version_info.version
 
             print(f"Model loaded via MLflow: {MODEL_NAME} v{model_state['version']} @{MODEL_ALIAS}")
-            return
 
         except Exception as e:
             print(f"MLflow reachable but load failed ({type(e).__name__}: {e})")
 
-    # --- Fallback: load from local joblib file ---
-    print(f"MLflow unreachable or failed. Loading from: {LOCAL_MODEL_FILE}")
-    model_state["model"]   = joblib.load(LOCAL_MODEL_FILE)
-    model_state["version"] = "local"
-    print(f"Model loaded from local file: {LOCAL_MODEL_FILE}")
+    # --- Fallback: load from local joblib file if model not yet loaded ---
+    if model_state["model"] is None:
+        print(f"MLflow unreachable or failed. Loading from: {LOCAL_MODEL_FILE}")
+        model_state["model"]   = joblib.load(LOCAL_MODEL_FILE)
+        model_state["version"] = "local"
+        print(f"Model loaded from local file: {LOCAL_MODEL_FILE}")
+
+    # --- Always load neighborhood encoding from JSON (needed in all paths) ---
+    if os.path.exists(LOCAL_NEIGHBORHOOD_ENCODING_FILE):
+        with open(LOCAL_NEIGHBORHOOD_ENCODING_FILE) as f:
+            model_state["neighborhood_encoding"] = json.load(f)
+        print(f"Neighborhood encoding loaded: {len(model_state['neighborhood_encoding'])} neighborhoods")
+    else:
+        print(f"WARNING: Neighborhood encoding not found at {LOCAL_NEIGHBORHOOD_ENCODING_FILE}")
 
 
 # ---------------------------------------------------------------------------
@@ -172,18 +191,20 @@ class PropertyFeatures(BaseModel):
         - Out-of-range value → 422 error (if we add validators)
 
     Field descriptions appear in the auto-generated API docs at /docs.
+    Call GET /neighborhoods to get the full list of valid neighborhood names.
     """
-    borough:              int   = Field(..., ge=1, le=5,   description="Borough code: 1=Manhattan 2=Bronx 3=Brooklyn 4=Queens 5=Staten Island")
+    borough:              int   = Field(..., ge=1, le=5,        description="Borough code: 1=Manhattan 2=Bronx 3=Brooklyn 4=Queens 5=Staten Island")
     zip_code:             int   = Field(..., ge=10000, le=11697, description="NYC ZIP code")
-    gross_square_feet:    float = Field(..., gt=0,          description="Total building area in square feet")
-    land_square_feet:     float = Field(..., ge=0,          description="Land area in square feet (0 for condo units)")
-    year_built:           int   = Field(..., ge=1800, le=2024, description="Year the building was constructed")
-    building_age:         int   = Field(..., ge=0,          description="Years old at time of sale (sale_year - year_built)")
-    commercial_units:     int   = Field(..., ge=0,          description="Number of commercial units")
-    residential_units:    int   = Field(..., ge=0,          description="Number of residential units")
-    has_commercial_units: int   = Field(..., ge=0, le=1,    description="Binary flag: 1 if commercial_units > 0")
-    building_class_code:  int   = Field(..., ge=0, le=7,    description="Building type: 0=Office 1=Retail 2=Garage 3=Warehouse 4=Hotel 5=Storage 6=VacantLand 7=Other")
-    sale_year:            int   = Field(..., ge=2022, le=2030, description="Year of sale")
+    gross_square_feet:    float = Field(..., gt=0,               description="Total building area in square feet")
+    land_square_feet:     float = Field(..., ge=0,               description="Land area in square feet (0 for condo units)")
+    building_age:         int   = Field(..., ge=0,               description="Age of building at time of sale (sale_year - year_built)")
+    commercial_units:     int   = Field(..., ge=0,               description="Number of commercial units")
+    residential_units:    int   = Field(..., ge=0,               description="Number of residential units")
+    has_commercial_units: int   = Field(..., ge=0, le=1,         description="Binary flag: 1 if commercial_units > 0")
+    building_class_code:  int   = Field(..., ge=0, le=7,         description="Building type: 0=Office 1=Retail 2=Garage 3=Warehouse 4=Hotel 5=Storage 6=VacantLand 7=Other")
+    neighborhood:         str   = Field(...,                     description="NYC neighborhood name in uppercase e.g. 'MIDTOWN WEST'. Call GET /neighborhoods for all valid values.")
+    sale_year:            int   = Field(..., ge=2022, le=2030,   description="Year of sale")
+    sale_month:           int   = Field(..., ge=1,   le=12,      description="Month of sale (1=Jan … 12=Dec)")
 
     model_config = {
         "json_schema_extra": {
@@ -192,13 +213,14 @@ class PropertyFeatures(BaseModel):
                 "zip_code":             10001,
                 "gross_square_feet":    8500.0,
                 "land_square_feet":     2000.0,
-                "year_built":           1962,
                 "building_age":         62,
                 "commercial_units":     3,
                 "residential_units":    0,
                 "has_commercial_units": 1,
                 "building_class_code":  1,
+                "neighborhood":         "MIDTOWN WEST",
                 "sale_year":            2024,
+                "sale_month":           6,
             }
         }
     }
@@ -252,6 +274,23 @@ def model_info():
     }
 
 
+@app.get("/neighborhoods", tags=["Prediction"])
+def list_neighborhoods():
+    """
+    Returns all valid neighborhood names accepted by the /predict endpoint.
+
+    Use this to find the exact neighborhood string to send in your request.
+    All names are uppercase (e.g. 'MIDTOWN WEST', 'FLUSHING-NORTH').
+    """
+    encoding = model_state["neighborhood_encoding"]
+    if not encoding:
+        raise HTTPException(status_code=503, detail="Neighborhood encoding not loaded.")
+    return {
+        "count":         len(encoding),
+        "neighborhoods": sorted(encoding.keys()),
+    }
+
+
 @app.post("/predict", response_model=PredictionResponse, tags=["Prediction"])
 def predict(features: PropertyFeatures):
     """
@@ -262,22 +301,56 @@ def predict(features: PropertyFeatures):
 
     The model was trained on log1p(sale_price).
     Predictions are automatically reversed with expm1() before returning.
+
+    Call GET /neighborhoods to get the full list of valid neighborhood names.
     """
     if model_state["model"] is None:
         raise HTTPException(status_code=503, detail="Model not loaded. Try again shortly.")
 
+    # Convert neighborhood name → integer code
+    encoding  = model_state["neighborhood_encoding"]
+    nbhd_name = features.neighborhood.strip().upper()
+    if nbhd_name not in encoding:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown neighborhood '{features.neighborhood}'. Call GET /neighborhoods for valid values.",
+        )
+    neighborhood_code = encoding[nbhd_name]
+
+    # Compute derived features (same logic as preprocess.py — must stay in sync)
+    floor_area_ratio = min(
+        features.gross_square_feet / (features.land_square_feet + 1),
+        100.0,          # clip at 100 to match training
+    )
+    log_gross_sqft = float(np.log1p(features.gross_square_feet))
+    total_units    = features.commercial_units + features.residential_units
+    is_manhattan   = 1 if features.borough == 1 else 0
+
     # Build feature array in exact column order the model was trained on
-    feature_order = [
-        "borough", "zip_code", "gross_square_feet", "land_square_feet",
-        "year_built", "building_age", "commercial_units", "residential_units",
-        "has_commercial_units", "building_class_code", "sale_year",
+    # Order must match FEATURE_COLS in train.py exactly
+    feature_values = [
+        features.borough,
+        features.zip_code,
+        features.gross_square_feet,
+        features.land_square_feet,
+        features.building_age,
+        features.commercial_units,
+        features.residential_units,
+        features.has_commercial_units,
+        features.building_class_code,
+        neighborhood_code,
+        features.sale_year,
+        features.sale_month,
+        floor_area_ratio,
+        log_gross_sqft,
+        total_units,
+        is_manhattan,
     ]
-    feature_values = [getattr(features, col) for col in feature_order]
     X = np.array([feature_values], dtype=np.float32)
 
     # Predict in log space, then reverse the log transform
-    log_prediction  = model_state["model"].predict(X)
-    price_dollars   = float(np.expm1(log_prediction[0]))
+    log_prediction = model_state["model"].predict(X)
+    price_dollars  = float(np.expm1(log_prediction[0]))
 
     return PredictionResponse(
         predicted_price=int(round(price_dollars)),

@@ -32,13 +32,14 @@ VALID_PAYLOAD = {
     "zip_code":             10001,
     "gross_square_feet":    8500.0,
     "land_square_feet":     2000.0,
-    "year_built":           1962,
     "building_age":         62,
     "commercial_units":     3,
     "residential_units":    0,
     "has_commercial_units": 1,
     "building_class_code":  1,
+    "neighborhood":         "MIDTOWN WEST",
     "sale_year":            2024,
+    "sale_month":           6,
 }
 
 
@@ -65,8 +66,9 @@ def client():
 
     # Replace load_production_model() with a function that sets model_state directly
     def fake_load():
-        app_module.model_state["model"]   = mock_model
-        app_module.model_state["version"] = "test-1"
+        app_module.model_state["model"]                 = mock_model
+        app_module.model_state["version"]               = "test-1"
+        app_module.model_state["neighborhood_encoding"] = {"MIDTOWN WEST": 0}
 
     with patch.object(app_module, "load_production_model", side_effect=fake_load):
         with TestClient(app_module.app) as test_client:
@@ -175,3 +177,43 @@ def test_predict_wrong_type(client):
     bad = {**VALID_PAYLOAD, "borough": "manhattan"}
     response = client.post("/predict", json=bad)
     assert response.status_code == 422
+
+
+def test_predict_invalid_sale_month(client):
+    """sale_month must be 1-12. Sending 13 should fail validation."""
+    bad = {**VALID_PAYLOAD, "sale_month": 13}
+    response = client.post("/predict", json=bad)
+    assert response.status_code == 422
+
+
+def test_predict_invalid_neighborhood(client):
+    """Unknown neighborhood name should return 422."""
+    bad = {**VALID_PAYLOAD, "neighborhood": "FAKE PLACE XYZ"}
+    response = client.post("/predict", json=bad)
+    assert response.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Tests: /neighborhoods
+# ---------------------------------------------------------------------------
+
+def test_neighborhoods_returns_200(client):
+    response = client.get("/neighborhoods")
+    assert response.status_code == 200
+
+
+def test_neighborhoods_has_count(client):
+    data = client.get("/neighborhoods").json()
+    assert "count" in data
+    assert data["count"] > 0
+
+
+def test_neighborhoods_has_list(client):
+    data = client.get("/neighborhoods").json()
+    assert "neighborhoods" in data
+    assert isinstance(data["neighborhoods"], list)
+
+
+def test_neighborhoods_contains_midtown(client):
+    data = client.get("/neighborhoods").json()
+    assert "MIDTOWN WEST" in data["neighborhoods"]

@@ -4,8 +4,8 @@ Layer 2 — Preprocessing & Feature Engineering
 Takes the raw NYC sales CSV (248,081 rows, all property types, all strings)
 and produces two clean, model-ready files:
 
-    data/processed/train.csv  — 80% of clean commercial sales
-    data/processed/test.csv   — 20% of clean commercial sales
+    data/processed/train.csv  — 2022–2023 clean commercial sales (train)
+    data/processed/test.csv   — 2024 clean commercial sales (test)
 
 Steps (in order):
     1. Filter to Tax Class 4 (commercial properties only)
@@ -14,19 +14,21 @@ Steps (in order):
     4. Drop rows with missing/zero gross_square_feet (can't impute building size)
     5. Fill remaining nulls  (year_built → median, land_sqft → 0)
     6. Remove outliers  (bottom 1% and top 1% of sale_price)
-    7. Engineer new features
-    8. Encode building class into simplified categories
-    9. Select final feature columns
-    10. Train / test split (80 / 20)
-    11. Save to data/processed/
+    7. Engineer new features  (building_age, has_commercial_units, building_class_code,
+                               floor_area_ratio, log_gross_sqft, total_units, is_manhattan, sale_month)
+    8. Filter extreme price_per_sqft values  ($50–$5,000/sqft)
+    9. Encode neighborhood names → integer codes, save mapping to models/
+    10. Select final feature columns
+    11. Time-based split: 2022–2023 → train, 2024 → test
+    12. Save to data/processed/
 """
 
+import json
 import os
 from typing import cast
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -37,6 +39,8 @@ RAW_FILE      = os.path.join(BASE_DIR, "data", "raw",       "nyc_rolling_sales_r
 PROCESSED_DIR = os.path.join(BASE_DIR, "data", "processed")
 TRAIN_FILE    = os.path.join(PROCESSED_DIR, "train.csv")
 TEST_FILE     = os.path.join(PROCESSED_DIR, "test.csv")
+MODELS_DIR                 = os.path.join(BASE_DIR, "models")
+NEIGHBORHOOD_ENCODING_FILE = os.path.join(MODELS_DIR, "neighborhood_encoding.json")
 
 # ---------------------------------------------------------------------------
 # Step 1 — Load raw data and filter to commercial (Tax Class 4)
@@ -104,9 +108,10 @@ def fix_dtypes(df: pd.DataFrame) -> pd.DataFrame:
     df["commercial_units"]  = pd.to_numeric(df["commercial_units"],  errors="coerce")
     df["residential_units"] = pd.to_numeric(df["residential_units"], errors="coerce")
 
-    # --- sale_date → extract sale_year (we use year as a feature, not raw date) ---
-    df["sale_date"] = pd.to_datetime(df["sale_date"], errors="coerce")
-    df["sale_year"] = df["sale_date"].dt.year
+    # --- sale_date → extract sale_year and sale_month ---
+    df["sale_date"]  = pd.to_datetime(df["sale_date"], errors="coerce")
+    df["sale_year"]  = df["sale_date"].dt.year
+    df["sale_month"] = df["sale_date"].dt.month
 
     # --- borough → already int, just make sure ---
     df["borough"] = pd.to_numeric(df["borough"], errors="coerce")
@@ -309,35 +314,151 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
         .astype(int)
     )
 
-    # price_per_sqft: for analysis only (not a model feature)
+    # price_per_sqft: for analysis only (not a model feature — divides the target)
     df["price_per_sqft"] = df["sale_price"] / df["gross_square_feet"]
+
+    # -----------------------------------------------------------------------
+    # Derived features (safe to use — all computed from property characteristics,
+    # no information from the target sale_price)
+    # -----------------------------------------------------------------------
+
+    # floor_area_ratio: gross_sqft divided by land_sqft
+    # High FAR = tall dense building (office tower). Low FAR = warehouse/garage.
+    # This is a fundamental NYC zoning metric and a key CRE valuation driver.
+    # +1 in denominator avoids division by zero for condo units with land_sqft=0.
+    df["floor_area_ratio"] = df["gross_square_feet"] / (df["land_square_feet"] + 1)
+    df["floor_area_ratio"] = df["floor_area_ratio"].clip(upper=100)  # cap extreme values
+
+    # log_gross_sqft: explicit log of building size
+    # gross_sqft spans 50 → 500,000 (a 10,000x range). Providing the log helps
+    # the model distinguish small vs large with fewer tree splits.
+    df["log_gross_sqft"] = np.log1p(df["gross_square_feet"])
+
+    # total_units: combined unit count — proxy for building complexity
+    df["total_units"] = df["commercial_units"] + df["residential_units"]
+
+    # is_manhattan: Manhattan commands a premium disproportionate to other boroughs
+    # Even though borough is already a feature, this explicit binary flag reinforces
+    # the signal for models that may not pick it up cleanly from the raw code.
+    df["is_manhattan"] = (df["borough"] == 1).astype(int)
+
+    # sale_month: NYC CRE has strong seasonality (Q4 peaks, Q1 slowest)
+    # Already extracted from sale_date in fix_dtypes()
+    # (kept here as a reminder that sale_month is now in the feature set)
 
     print("  New features created:")
     print(f"    building_age          min={df['building_age'].min():.0f}  max={df['building_age'].max():.0f}  mean={df['building_age'].mean():.1f}")
     print(f"    has_commercial_units  values: {df['has_commercial_units'].value_counts().to_dict()}")
     print(f"    building_class_code   distribution:\n{df['building_class_simplified'].value_counts().to_string()}")
     print(f"    price_per_sqft        median=${df['price_per_sqft'].median():,.0f}")
+    print(f"    floor_area_ratio      median={df['floor_area_ratio'].median():.2f}  max={df['floor_area_ratio'].max():.2f}")
+    print(f"    log_gross_sqft        min={df['log_gross_sqft'].min():.2f}  max={df['log_gross_sqft'].max():.2f}")
+    print(f"    total_units           median={df['total_units'].median():.0f}")
+    print(f"    is_manhattan          {df['is_manhattan'].value_counts().to_dict()}")
+    print(f"    sale_month            range={df['sale_month'].min():.0f}–{df['sale_month'].max():.0f}")
 
     return df
 
 
 # ---------------------------------------------------------------------------
-# Step 8 — Select final columns
+# Step 8 — Filter extreme price_per_sqft values
+# ---------------------------------------------------------------------------
+
+def filter_price_per_sqft_outliers(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Remove properties with unrealistic price per square foot.
+
+    Why do this after the 1% outlier removal?
+        The 1% trim removes extreme total prices, but a tiny cheap building
+        can still have absurd $/sqft (e.g. $5 sale / 1 sqft = $5/sqft).
+        Filtering on $/sqft catches a different class of bad data.
+
+    NYC CRE $/sqft range:
+        Below $50  → likely data errors or non-market transfers we missed
+        Above $5,000 → ultra-premium trophy assets that skew the model
+        $50–$5,000 covers the vast majority of real commercial transactions.
+    """
+    print("\nFiltering extreme price_per_sqft values...")
+    before = len(df)
+
+    low, high = 50, 5_000
+    df = cast(
+        pd.DataFrame,
+        df[(df["price_per_sqft"] >= low) & (df["price_per_sqft"] <= high)].copy(),
+    )
+
+    print(f"  Kept range  : ${low}–${high:,}/sqft")
+    print(f"  Removed     : {before - len(df):,} rows")
+    print(f"  Remaining   : {len(df):,} rows")
+    print(f"  Median $/sqft: ${df['price_per_sqft'].median():,.0f}")
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Step 9 — Encode neighborhood
+# ---------------------------------------------------------------------------
+
+def encode_neighborhood(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """
+    Label-encode the neighborhood column into a numeric code.
+
+    Why label encoding and not one-hot?
+        238 unique neighborhoods → 238 extra binary columns with one-hot.
+        XGBoost with enable_categorical=True handles integer-encoded categories
+        correctly — no ordinal relationship is assumed between the codes.
+
+    Encoding is sorted alphabetically so codes are stable across re-runs.
+    The mapping is saved to models/neighborhood_encoding.json so the API
+    can convert a neighborhood name string → code at prediction time.
+    """
+    print("\nEncoding neighborhoods...")
+
+    # Normalise: strip whitespace and uppercase for consistency
+    df["neighborhood"] = df["neighborhood"].str.strip().str.upper()
+
+    # Build encoding sorted alphabetically — reproducible across runs
+    unique_neighborhoods = sorted(df["neighborhood"].unique())
+    encoding = {name: i for i, name in enumerate(unique_neighborhoods)}
+
+    df["neighborhood_code"] = df["neighborhood"].map(encoding).fillna(-1).astype(int)
+
+    print(f"  {len(encoding)} unique neighborhoods encoded (0–{len(encoding) - 1})")
+    print(f"  Sample mappings: { {k: v for k, v in list(encoding.items())[:4]} }")
+
+    return df, encoding
+
+
+def save_neighborhood_encoding(encoding: dict) -> None:
+    """Save neighborhood → code mapping as JSON for the API to use at inference."""
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    with open(NEIGHBORHOOD_ENCODING_FILE, "w") as f:
+        json.dump(encoding, f, indent=2, sort_keys=True)
+    print(f"\nNeighborhood encoding saved → {NEIGHBORHOOD_ENCODING_FILE}")
+    print(f"  ({len(encoding)} neighborhoods)")
+
+
+# ---------------------------------------------------------------------------
+# Step 10 — Select final columns
 # ---------------------------------------------------------------------------
 
 # These are the columns the model will train on (features) + target
 FEATURE_COLS = [
-    "borough",             # 1–5 (Manhattan to Staten Island)
-    "zip_code",            # postal code — ~170 buckets, much more granular than borough
-    "gross_square_feet",   # total building area — strongest predictor
-    "land_square_feet",    # land area (0 for condo units)
-    "year_built",          # raw year (model can use alongside building_age)
-    "building_age",        # years old at time of sale
-    "commercial_units",    # number of commercial units
-    "residential_units",   # number of residential units
-    "has_commercial_units",# binary flag
-    "building_class_code", # encoded building type (0–7)
-    "sale_year",           # year of sale (captures market trends over time)
+    "borough",              # 1–5 (Manhattan to Staten Island) — treated as category
+    "zip_code",             # postal code — ~170 buckets — treated as category
+    "gross_square_feet",    # total building area — strongest predictor
+    "land_square_feet",     # land area (0 for condo units)
+    "building_age",         # years old at time of sale (replaces year_built — less redundancy)
+    "commercial_units",     # number of commercial units
+    "residential_units",    # number of residential units
+    "has_commercial_units", # binary flag
+    "building_class_code",  # encoded building type (0–7) — treated as category
+    "neighborhood_code",    # encoded neighborhood (0–237) — treated as category
+    "sale_year",            # year of sale (captures market trends over time)
+    "sale_month",           # month of sale (1–12) — seasonal pricing signal
+    "floor_area_ratio",     # gross_sqft / land_sqft — building density (core NYC metric)
+    "log_gross_sqft",       # log1p(gross_sqft) — explicit size scale for the model
+    "total_units",          # commercial + residential units — building complexity
+    "is_manhattan",         # binary: borough == 1 — Manhattan premium signal
 ]
 
 TARGET_COL = "sale_price"
@@ -370,27 +491,30 @@ def select_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def split_and_save(df: pd.DataFrame) -> None:
     """
-    Split 80/20 into train and test sets. Save both as CSV.
+    Time-based split: 2022–2023 sales → train, 2024 sales → test.
 
-    random_state=42 ensures the split is reproducible — every time we run
-    this script we get the exact same train/test split.
+    Why time-based instead of random 80/20?
+        In production, models always train on historical data and predict on
+        future data. A random split would let 2024 prices "leak" into training,
+        making test metrics look artificially better than real-world performance.
 
-    We do NOT shuffle by date here intentionally — for simplicity in Layer 2.
-    A more advanced version (Layer 2+) could do a time-based split.
+        Time-based split gives an honest measure: "how well does this model
+        predict 2024 prices when only trained on 2022–2023 data?"
     """
-    print("\nSplitting into train (80%) and test (20%)...")
+    print("\nTime-based split: 2022–2023 → train, 2024 → test...")
 
-    train, test = cast(
-        tuple[pd.DataFrame, pd.DataFrame],
-        train_test_split(df, test_size=0.2, random_state=42),
-    )
+    train = cast(pd.DataFrame, df[df["sale_year"] < 2024].copy())
+    test  = cast(pd.DataFrame, df[df["sale_year"] == 2024].copy())
 
-    print(f"  Train: {len(train):,} rows")
-    print(f"  Test:  {len(test):,} rows")
+    print(f"  Train: {len(train):,} rows (2022–2023)")
+    print(f"  Test:  {len(test):,} rows (2024)")
+
+    if len(test) == 0:
+        raise ValueError("No 2024 data found. Check the sale_year column.")
 
     os.makedirs(PROCESSED_DIR, exist_ok=True)
     train.to_csv(TRAIN_FILE, index=False)
-    test.to_csv(TEST_FILE,  index=False)
+    test.to_csv(TEST_FILE,   index=False)
 
     print(f"\n  Saved: {TRAIN_FILE}")
     print(f"  Saved: {TEST_FILE}")
@@ -411,9 +535,12 @@ def main():
     df = drop_missing_sqft(df)
     df = fill_nulls(df)
     df = remove_outliers(df)
-    df = engineer_features(df)
+    df = engineer_features(df)                          # computes price_per_sqft
+    df = filter_price_per_sqft_outliers(df)             # NEW: filter on $/sqft
+    df, neighborhood_encoding = encode_neighborhood(df) # NEW: neighborhood → code
+    save_neighborhood_encoding(neighborhood_encoding)   # NEW: save JSON mapping
     df = select_columns(df)
-    split_and_save(df)
+    split_and_save(df)                                  # NEW: time-based split
 
     print("\n" + "=" * 60)
     print("PREPROCESSING COMPLETE")

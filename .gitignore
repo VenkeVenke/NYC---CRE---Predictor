@@ -2,9 +2,10 @@
 data/raw/
 data/processed/
 
-# Model artifacts (directory ignored, but the joblib file is committed for deployment)
+# Model artifacts (directory ignored, but key files are committed for deployment)
 models/*
 !models/xgboost_model.joblib
+!models/neighborhood_encoding.json
 
 # MLflow tracking data
 mlruns/
