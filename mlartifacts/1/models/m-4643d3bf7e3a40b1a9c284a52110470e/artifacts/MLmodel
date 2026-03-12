@@ -1,0 +1,41 @@
+artifact_path: mlflow-artifacts:/1/models/m-4643d3bf7e3a40b1a9c284a52110470e/artifacts
+flavors:
+  python_function:
+    data: model.ubj
+    env:
+      conda: conda.yaml
+      virtualenv: python_env.yaml
+    loader_module: mlflow.xgboost
+    python_version: 3.13.5
+  xgboost:
+    code: null
+    data: model.ubj
+    model_class: xgboost.sklearn.XGBRegressor
+    model_format: ubj
+    xgb_version: 2.0.3
+is_signature_from_type_hint: false
+mlflow_version: 3.10.1
+model_id: m-4643d3bf7e3a40b1a9c284a52110470e
+model_size_bytes: 1912751
+model_uuid: m-4643d3bf7e3a40b1a9c284a52110470e
+prompts: null
+run_id: 016d3194dc7c44b19bb2bc6475084221
+saved_input_example_info:
+  artifact_path: input_example.json
+  pandas_orient: split
+  serving_input_path: serving_input_example.json
+  type: dataframe
+signature:
+  inputs: '[{"type": "long", "name": "borough", "required": true}, {"type": "long",
+    "name": "zip_code", "required": true}, {"type": "double", "name": "gross_square_feet",
+    "required": true}, {"type": "double", "name": "land_square_feet", "required":
+    true}, {"type": "double", "name": "year_built", "required": true}, {"type": "long",
+    "name": "building_age", "required": true}, {"type": "double", "name": "commercial_units",
+    "required": true}, {"type": "double", "name": "residential_units", "required":
+    true}, {"type": "long", "name": "has_commercial_units", "required": true}, {"type":
+    "long", "name": "building_class_code", "required": true}, {"type": "long", "name":
+    "sale_year", "required": true}]'
+  outputs: '[{"type": "float", "required": true}]'
+  params: null
+type_hint_from_example: false
+utc_time_created: '2026-03-11 22:31:27.385265'

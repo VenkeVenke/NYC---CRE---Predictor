@@ -42,6 +42,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # (done after pip install so code changes don't invalidate the pip cache)
 COPY src/ ./src/
 
+# Copy the trained model file
+# This is the fallback model used when MLflow is not available (e.g. on Render)
+COPY models/ ./models/
+
 # Expose the port FastAPI listens on
 EXPOSE 8000
 

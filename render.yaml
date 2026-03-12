@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: nyc-cre-predictor
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: MLFLOW_TRACKING_URI
+        value: http://localhost:9999
+      - key: MODEL_NAME
+        value: nyc-cre-xgboost
+      - key: MODEL_ALIAS
+        value: production
+      - key: LOCAL_MODEL_FILE
+        value: /app/models/xgboost_model.joblib

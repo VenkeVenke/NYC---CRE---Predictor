@@ -2,8 +2,9 @@
 data/raw/
 data/processed/
 
-# Model artifacts
-models/
+# Model artifacts (directory ignored, but the joblib file is committed for deployment)
+models/*
+!models/xgboost_model.joblib
 
 # MLflow tracking data
 mlruns/
