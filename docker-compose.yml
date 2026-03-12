@@ -1,0 +1,70 @@
+# ============================================================
+# docker-compose.yml — Local Development Stack
+# ============================================================
+#
+# Runs two services together:
+#   mlflow  → MLflow tracking server (port 5000)
+#   fastapi → FastAPI prediction server (port 8000)
+#
+# How to use:
+#   docker compose up --build        # build + start both services
+#   docker compose down              # stop and remove containers
+#   docker compose logs fastapi      # view FastAPI logs
+#   docker compose logs mlflow       # view MLflow logs
+#
+# Data persistence:
+#   MLflow stores run data in mlruns/ on your laptop.
+#   The volume mount (./mlruns → /app/mlruns) means the container
+#   reads and writes to your local mlruns/ folder — so data survives
+#   container restarts and is visible in your local MLflow UI too.
+
+services:
+
+  # ----------------------------------------------------------
+  # Service 1: MLflow Tracking Server
+  # ----------------------------------------------------------
+  mlflow:
+    image: python:3.11-slim          # use same base as our app
+    container_name: mlflow-server
+    working_dir: /app
+    command: >
+      bash -c "pip install mlflow==3.10.1 --quiet &&
+               mlflow server
+               --host 0.0.0.0
+               --port 5000
+               --backend-store-uri sqlite:////app/mlflow.db
+               --default-artifact-root /app/mlartifacts
+               --allowed-hosts '*'
+               --cors-allowed-origins '*'"
+    ports:
+      - "5001:5000"                  # host:container — access UI at localhost:5001 (5000 taken by macOS AirPlay)
+    volumes:
+      - ./mlflow.db:/app/mlflow.db       # real MLflow database (created during local training)
+      - ./mlartifacts:/app/mlartifacts   # real model artifacts (created during local training)
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s             # give MLflow time to install + boot
+
+  # ----------------------------------------------------------
+  # Service 2: FastAPI Prediction Server
+  # ----------------------------------------------------------
+  fastapi:
+    build:
+      context: .                     # use Dockerfile in project root
+      dockerfile: Dockerfile
+    container_name: fastapi-server
+    ports:
+      - "8000:8000"                  # host:container — call API at localhost:8000
+    environment:
+      # Override the default localhost URL so FastAPI finds MLflow
+      # Inside Docker, containers talk via service name, not 127.0.0.1
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - MODEL_NAME=nyc-cre-xgboost
+      - MODEL_ALIAS=production
+      - LOCAL_MODEL_FILE=/app/models/xgboost_model.joblib
+    volumes:
+      - ./models:/app/models         # joblib fallback when MLflow is unreachable
+    restart: on-failure              # restart if the app crashes

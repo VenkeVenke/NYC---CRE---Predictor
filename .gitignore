@@ -1,0 +1,35 @@
+# Data files (too large for git, re-downloadable)
+data/raw/
+data/processed/
+
+# Model artifacts
+models/
+
+# MLflow tracking data
+mlruns/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Env files
+.env
+*.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.cursor/
+.vscode/
+pyrightconfig.json
