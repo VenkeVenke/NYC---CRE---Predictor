@@ -364,21 +364,88 @@ uvicorn src.serving.app:app --reload --port 8000
 
 ---
 
-### ⬜ Layer 6 — Docker
+### ✅ Layer 6 — Docker
 
-*Coming after Layer 5.*
+**What it does:**
+Containerizes the entire application so it runs identically on any machine — local Mac, CI server, or cloud. Two containers orchestrated via `docker-compose.yml` for local development; a single production `Dockerfile` for Render.
+
+**Two Docker setups:**
+
+| File | Purpose | Containers |
+|---|---|---|
+| `docker-compose.yml` | Local development | MLflow (port 5500) + FastAPI (port 8000) |
+| `Dockerfile` | Production (Render) | FastAPI only — joblib fallback for model |
+
+**Key concepts learned:**
+- `0.0.0.0` vs `127.0.0.1` — containers must bind to `0.0.0.0` to be reachable from other containers
+- Docker DNS — containers talk via service name (`http://mlflow:5000`), not `localhost`
+- Port mapping — `HOST:CONTAINER` (e.g. `5500:5000` = access at `localhost:5500`, runs on `5000` inside)
+- MLflow 3.x security middleware — requires `--allowed-hosts '*'` to accept cross-container requests
+- `depends_on` with `condition: service_healthy` — FastAPI waits for MLflow to be ready before starting
+
+**Run locally:**
+```bash
+docker compose up --build
+# MLflow UI: http://localhost:5500
+# FastAPI:   http://localhost:8000
+```
+
+**Production Dockerfile** builds a minimal image: copies `src/` and `models/` (joblib fallback), installs `requirements.txt`, exposes port 8000, runs uvicorn.
 
 ---
 
-### ⬜ Layer 7 — GitHub Actions CI/CD
+### ✅ Layer 7 — GitHub Actions CI/CD
 
-*Coming after Layer 6.*
+**What it does:**
+Automated 3-job pipeline triggered on every push. Ensures code is tested and the Docker image builds successfully before deploying to production.
+
+**Pipeline:**
+```
+Push to GitHub
+      ↓
+Job 1: Run Tests (55s)         — pytest on all unit tests
+      ↓ (only if tests pass)
+Job 2: Build Docker Image (1m 8s) — proves containerization works
+      ↓ (only if build passes, only on main branch)
+Job 3: Deploy to Render (3s)   — triggers Render redeploy via deploy hook
+```
+
+**Key concepts learned:**
+- `needs:` — job dependency chain (Job 2 waits for Job 1, Job 3 waits for Job 2)
+- `if: github.ref == 'refs/heads/main'` — deploy only on main branch, not feature branches
+- GitHub Secrets — sensitive values (`RENDER_DEPLOY_HOOK_URL`) stored encrypted, referenced as `${{ secrets.NAME }}`
+- Render deploy hook — a POST URL that triggers a redeployment
+- YAML quoting — `'*'` inside bash `-c "..."` passes literal quotes; use YAML list format + `|` block scalar to fix
+
+**CI file:** `.github/workflows/ci.yml`
 
 ---
 
-### ⬜ Layer 8 — Deploy to Render
+### ✅ Layer 8 — Deploy to Render
 
-*Coming after Layer 7.*
+**What it does:**
+Hosts the FastAPI prediction service as a live public endpoint. Render reads the `Dockerfile`, builds and runs the container, and serves it over HTTPS.
+
+**Live URL:** `https://nyc-cre-predictor.onrender.com`
+
+**Endpoints:**
+```bash
+GET  /health        # Server + model status
+GET  /model-info    # Which model version is loaded
+POST /predict       # Send features → get predicted price
+```
+
+**How it works:**
+- Render watches the GitHub repo (or is triggered by GitHub Actions Job 3)
+- Reads `Dockerfile` → builds the image on Render's servers → runs the container
+- FastAPI loads the model from `models/xgboost_model.joblib` (joblib fallback, since MLflow is not hosted)
+- Auto-deploy is disabled — deployments only happen when GitHub Actions CI passes
+
+**Key concepts learned:**
+- Render uses `Dockerfile` only (not `docker-compose.yml`) — single container in production
+- Hosted MLflow (Databricks, AWS) = production pattern where cloud also reads from registry
+- Corporate CI/CD pattern: CI builds image → pushes to Docker Hub → cloud pulls pre-built image
+- Deploy hook vs auto-deploy — CI-controlled deploys prevent broken code from going live
 
 ---
 
