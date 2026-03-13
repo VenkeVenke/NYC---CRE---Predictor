@@ -20,7 +20,7 @@ Log transform:
 
 Run locally:
     # Make sure MLflow server is running first (from Layer 4):
-    mlflow server --host 127.0.0.1 --port 5000
+    mlflow server --host 127.0.0.1 --port 5500
 
     # Then start this server:
     uvicorn src.serving.app:app --reload --port 8000
@@ -52,7 +52,7 @@ from mlflow import MlflowClient
 # Configuration
 # ---------------------------------------------------------------------------
 
-MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000")
+MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://127.0.0.1:5500")
 MODEL_NAME          = os.getenv("MODEL_NAME",          "nyc-cre-xgboost")
 MODEL_ALIAS         = os.getenv("MODEL_ALIAS",         "production")
 
@@ -74,11 +74,16 @@ model_state: dict = {
 # Startup: load model from MLflow
 # ---------------------------------------------------------------------------
 
-LOCAL_MODEL_FILE = os.getenv("LOCAL_MODEL_FILE", "/app/models/xgboost_model.joblib")
-
-# Neighborhood encoding file — resolves relative to this file so it works
-# both locally (src/serving/../../models/) and in Docker (/app/models/)
+# Resolves relative to this file so it works both locally and in Docker.
+# Local:  src/serving/../../models/  →  models/
+# Docker: LOCAL_MODEL_FILE env var overrides the default → /app/models/
 _HERE = os.path.dirname(os.path.abspath(__file__))
+
+LOCAL_MODEL_FILE = os.getenv(
+    "LOCAL_MODEL_FILE",
+    os.path.normpath(os.path.join(_HERE, "..", "..", "models", "xgboost_model.joblib")),
+)
+
 LOCAL_NEIGHBORHOOD_ENCODING_FILE = os.getenv(
     "NEIGHBORHOOD_ENCODING_FILE",
     os.path.normpath(os.path.join(_HERE, "..", "..", "models", "neighborhood_encoding.json")),

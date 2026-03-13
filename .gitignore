@@ -9,6 +9,8 @@ models/*
 
 # MLflow tracking data
 mlruns/
+mlflow.db
+mlartifacts/
 
 # Python
 __pycache__/

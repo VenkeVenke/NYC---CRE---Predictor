@@ -27,17 +27,20 @@ services:
     image: python:3.11-slim          # use same base as our app
     container_name: mlflow-server
     working_dir: /app
-    command: >
-      bash -c "pip install mlflow==3.10.1 --quiet &&
-               mlflow server
-               --host 0.0.0.0
-               --port 5000
-               --backend-store-uri sqlite:////app/mlflow.db
-               --default-artifact-root /app/mlartifacts
-               --allowed-hosts '*'
-               --cors-allowed-origins '*'"
+    command:
+      - bash
+      - -c
+      - |
+        pip install mlflow==3.10.1 --quiet
+        mlflow server \
+          --host 0.0.0.0 \
+          --port 5000 \
+          --backend-store-uri sqlite:////app/mlflow.db \
+          --default-artifact-root /app/mlartifacts \
+          --allowed-hosts '*' \
+          --cors-allowed-origins '*'
     ports:
-      - "5001:5000"                  # host:container — access UI at localhost:5001 (5000 taken by macOS AirPlay)
+      - "5500:5000"                  # host:container — access UI at localhost:5500 (matches train.py default)
     volumes:
       - ./mlflow.db:/app/mlflow.db       # real MLflow database (created during local training)
       - ./mlartifacts:/app/mlartifacts   # real model artifacts (created during local training)
@@ -67,4 +70,7 @@ services:
       - LOCAL_MODEL_FILE=/app/models/xgboost_model.joblib
     volumes:
       - ./models:/app/models         # joblib fallback when MLflow is unreachable
+    depends_on:
+      mlflow:
+        condition: service_healthy   # wait for MLflow to be ready before starting FastAPI
     restart: on-failure              # restart if the app crashes

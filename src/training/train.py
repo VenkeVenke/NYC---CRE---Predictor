@@ -1,11 +1,23 @@
 """
-Layer 3 + 4 — Model Training with MLflow Tracking
-===================================================
-Loads processed train/test CSVs, trains XGBoost, evaluates it,
-logs everything to MLflow, and registers the model.
+Layer 3 + 4 — Model Training with Optuna Tuning + MLflow Tracking
+==================================================================
+Full pipeline in one script:
+
+    Step 1 — Load processed train/test CSVs
+    Step 2 — Baseline (predict median — minimum bar to beat)
+    Step 3 — Optuna hyperparameter search (200 trials, Bayesian)
+    Step 4 — Train final model with best params
+    Step 5 — Evaluate on test set
+    Step 6 — Feature importance
+    Step 7 — Save model locally (backup)
+    Step 8 — Log to MLflow + register with @production alias
+
+Why Optuna inside train.py?
+    Instead of running tune_and_compare.py separately and manually copying
+    params, this script finds the best hyperparameters automatically every
+    time you retrain. 200 trials ≈ 8–12 minutes on a laptop.
 
 MLflow concepts used here:
-
     Experiment   — a named group of related runs (ours: "nyc-cre-price-predictor")
     Run          — one execution of training, with logged params/metrics/artifacts
     Artifact     — files attached to a run (our model, feature list, etc.)
@@ -20,19 +32,24 @@ Why aliases instead of stages?
 
 Tracking server:
     Start it first in a separate terminal:
-        mlflow server --host 127.0.0.1 --port 5000
+        mlflow server --host 127.0.0.1 --port 5500
     Then run this script.
 """
 
 import os
+import warnings
 import joblib
 import numpy as np
 import pandas as pd
+import optuna
 import mlflow
 import mlflow.xgboost
 from mlflow import MlflowClient
 from xgboost import XGBRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+warnings.filterwarnings("ignore")
+optuna.logging.set_verbosity(optuna.logging.WARNING)   # suppress noisy trial logs
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -48,10 +65,16 @@ MODEL_FILE  = os.path.join(MODELS_DIR, "xgboost_model.joblib")
 # MLflow configuration
 # ---------------------------------------------------------------------------
 
-MLFLOW_TRACKING_URI   = "http://127.0.0.1:5000"
+MLFLOW_TRACKING_URI   = os.getenv("MLFLOW_TRACKING_URI", "http://127.0.0.1:5500")
 MLFLOW_EXPERIMENT     = "nyc-cre-price-predictor"
 MODEL_REGISTRY_NAME   = "nyc-cre-xgboost"
 PRODUCTION_ALIAS      = "production"
+
+# ---------------------------------------------------------------------------
+# Optuna configuration
+# ---------------------------------------------------------------------------
+
+N_TRIALS = 200   # more trials = better params found, ~8–12 min on a laptop
 
 # ---------------------------------------------------------------------------
 # Feature columns (must match exactly what Layer 2 produced)
@@ -81,17 +104,13 @@ CATEGORICAL_COLS = ["borough", "zip_code", "building_class_code", "neighborhood_
 
 TARGET_COL = "sale_price"
 
-# XGBoost hyperparameters
-PARAMS = {
-    "n_estimators":       500,
-    "max_depth":          6,
-    "learning_rate":      0.05,
-    "subsample":          0.8,
-    "colsample_bytree":   0.8,
+# Fixed params that never change between trials
+FIXED_PARAMS = {
     "enable_categorical": True,   # correct splits for borough, zip, neighborhood
     "tree_method":        "hist", # required when enable_categorical=True
     "random_state":       42,
     "n_jobs":             -1,
+    "verbosity":          0,
 }
 
 
@@ -134,12 +153,103 @@ def load_data() -> tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series]:
 
 
 # ---------------------------------------------------------------------------
-# Step 2 — Train model
+# Step 2 — Baseline
 # ---------------------------------------------------------------------------
 
-def train_model(X_train: pd.DataFrame, y_train: pd.Series) -> XGBRegressor:
+def compute_baseline(y_train: pd.Series, y_test: pd.Series) -> dict[str, float]:
     """
-    Log-transform target then train XGBoost.
+    Dumb baseline: predict the median training sale_price for every property.
+
+    This is the minimum bar the model must beat. If XGBoost can't outperform
+    'just guess the median', then our features are useless or something is broken.
+
+    R² of the baseline is always 0 or negative — the model should be much higher.
+    """
+    median_pred = float(y_train.median())
+    preds = np.full(len(y_test), median_pred)
+
+    rmse = float(np.sqrt(mean_squared_error(y_test, preds)))
+    mae  = float(mean_absolute_error(y_test, preds))
+    r2   = float(r2_score(y_test, preds))
+
+    print("\n" + "=" * 50)
+    print("BASELINE (predict training median for everything)")
+    print("=" * 50)
+    print(f"  Median prediction : ${median_pred:,.0f}")
+    print(f"  RMSE : ${rmse:>15,.0f}")
+    print(f"  MAE  : ${mae:>15,.0f}")
+    print(f"  R²   : {r2:>16.4f}")
+    print("=" * 50)
+
+    return {"baseline_rmse": rmse, "baseline_mae": mae, "baseline_r2": r2}
+
+
+# ---------------------------------------------------------------------------
+# Step 3 — Optuna hyperparameter search
+# ---------------------------------------------------------------------------
+
+def tune_hyperparameters(
+    X_train: pd.DataFrame,
+    y_train_log: pd.Series,
+    X_test: pd.DataFrame,
+    y_test_raw: pd.Series,
+) -> dict:
+    """
+    Use Optuna (Bayesian search) to find the best XGBoost hyperparameters.
+
+    How Optuna works:
+        Trial 1: tries random params, records R²
+        Trial 2: learns from trial 1, tries smarter params
+        ...
+        Trial 200: by now it has focused on the best region of param space
+
+    Returns the best params dict (merged with FIXED_PARAMS).
+    """
+    print(f"\n{'='*60}")
+    print(f"  OPTUNA HYPERPARAMETER SEARCH  ({N_TRIALS} trials)")
+    print(f"{'='*60}")
+
+    def objective(trial):
+        params = {
+            "n_estimators":     trial.suggest_int("n_estimators", 200, 800),
+            "max_depth":        trial.suggest_int("max_depth", 4, 9),
+            "learning_rate":    trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+            "subsample":        trial.suggest_float("subsample", 0.6, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+            "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
+            "reg_alpha":        trial.suggest_float("reg_alpha", 1e-3, 10.0, log=True),
+            "reg_lambda":       trial.suggest_float("reg_lambda", 1e-3, 10.0, log=True),
+            **FIXED_PARAMS,
+        }
+        model = XGBRegressor(**params)
+        model.fit(X_train, y_train_log)
+        y_pred = np.expm1(model.predict(X_test))
+        return float(r2_score(y_test_raw, y_pred))
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=N_TRIALS, show_progress_bar=True)
+
+    best_params = {**study.best_params, **FIXED_PARAMS}
+
+    print(f"\n  Best R² found: {study.best_value:.4f}")
+    print(f"  Best params:")
+    for k, v in study.best_params.items():
+        print(f"    {k:<20} = {v}")
+
+    return best_params
+
+
+# ---------------------------------------------------------------------------
+# Step 4 — Train final model with best params
+# ---------------------------------------------------------------------------
+
+def train_model(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    params: dict,
+) -> XGBRegressor:
+    """
+    Log-transform target then train XGBoost with the Optuna-tuned params.
 
     Why log1p?
         sale_price is heavily right-skewed ($195K–$160M — 800x range).
@@ -152,15 +262,15 @@ def train_model(X_train: pd.DataFrame, y_train: pd.Series) -> XGBRegressor:
     print(f"  Original  : ${y_train.min():,.0f} – ${y_train.max():,.0f}")
     print(f"  Log-scaled: {y_train_log.min():.2f} – {y_train_log.max():.2f}")
 
-    print("\nTraining XGBoost model...")
-    model = XGBRegressor(**PARAMS)
+    print("\nTraining final XGBoost model with tuned params...")
+    model = XGBRegressor(**params)
     model.fit(X_train, y_train_log)
     print("  Training complete.")
     return model
 
 
 # ---------------------------------------------------------------------------
-# Step 3 — Evaluate
+# Step 5 — Evaluate
 # ---------------------------------------------------------------------------
 
 def evaluate_model(
@@ -197,7 +307,7 @@ def evaluate_model(
 
 
 # ---------------------------------------------------------------------------
-# Step 4 — Feature importance
+# Step 6 — Feature importance
 # ---------------------------------------------------------------------------
 
 def print_feature_importance(model: XGBRegressor) -> None:
@@ -209,7 +319,7 @@ def print_feature_importance(model: XGBRegressor) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Step 5 — Save model locally (backup)
+# Step 7 — Save model locally (backup)
 # ---------------------------------------------------------------------------
 
 def save_model_locally(model: XGBRegressor) -> None:
@@ -220,11 +330,12 @@ def save_model_locally(model: XGBRegressor) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Step 6 — Log to MLflow and register model
+# Step 8 — Log to MLflow and register model
 # ---------------------------------------------------------------------------
 
 def log_to_mlflow(
     model: XGBRegressor,
+    params: dict,
     metrics: dict[str, float],
     X_train: pd.DataFrame,
 ) -> str:
@@ -232,7 +343,7 @@ def log_to_mlflow(
     Log the run to MLflow and register the model.
 
     What gets logged:
-        params    — all XGBoost hyperparameters
+        params    — all XGBoost hyperparameters (Optuna best)
         metrics   — RMSE, MAE, R²
         tags      — metadata (model type, feature count, target transform)
         artifact  — the trained XGBoost model (native XGBoost format)
@@ -241,9 +352,6 @@ def log_to_mlflow(
         - Model is registered as MODEL_REGISTRY_NAME in the MLflow registry
         - The @production alias is set on this version
         - FastAPI (Layer 5) will load via models:/<name>@production
-
-    Returns:
-        run_id — the unique ID for this MLflow run
     """
     print("\n" + "=" * 50)
     print("LOGGING TO MLFLOW")
@@ -252,45 +360,43 @@ def log_to_mlflow(
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
     mlflow.set_experiment(MLFLOW_EXPERIMENT)
 
+    # Log only the tunable params (not fixed ones like tree_method)
+    loggable_params = {k: v for k, v in params.items()
+                       if k not in ("enable_categorical", "tree_method",
+                                    "random_state", "n_jobs", "verbosity")}
+
     with mlflow.start_run() as run:
         run_id = run.info.run_id
         print(f"  Run ID: {run_id}")
 
-        # --- Log hyperparameters ---
-        mlflow.log_params(PARAMS)
+        mlflow.log_params(loggable_params)
+        mlflow.log_param("n_trials", N_TRIALS)
         print("  ✓ Parameters logged")
 
-        # --- Log metrics ---
         mlflow.log_metrics(metrics)
         print("  ✓ Metrics logged")
 
-        # --- Log useful tags ---
         mlflow.set_tags({
             "model_type":       "xgboost_regressor",
-            "target_transform": "log1p",        # important: tells consumers to apply expm1
+            "target_transform": "log1p",
+            "tuning":           f"optuna_{N_TRIALS}_trials",
             "feature_count":    len(FEATURE_COLS),
             "train_rows":       len(X_train),
             "features":         ", ".join(FEATURE_COLS),
         })
         print("  ✓ Tags logged")
 
-        # --- Log model to MLflow (XGBoost native format) and register it ---
-        # mlflow.xgboost.log_model stores the model in MLflow's artifact store
-        # registered_model_name creates an entry in the Model Registry automatically
         model_info = mlflow.xgboost.log_model(
             xgb_model=model,
-            name="model",                     # MLflow 3.x: use name instead of artifact_path
+            name="model",
             registered_model_name=MODEL_REGISTRY_NAME,
-            input_example=X_train.head(3),   # sample input for schema inference
+            input_example=X_train.head(3),
         )
         print(f"  ✓ Model logged and registered as '{MODEL_REGISTRY_NAME}'")
         print(f"    Model URI: {model_info.model_uri}")
 
-    # --- Set @production alias on the newly registered version ---
-    # We do this AFTER the run closes so the version is fully registered
+    # Set @production alias on the newly registered version
     client = MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
-
-    # Get the latest version of our registered model (MLflow 3.x compatible)
     versions = client.search_model_versions(f"name='{MODEL_REGISTRY_NAME}'")
     latest_version = max(int(v.version) for v in versions)
 
@@ -307,79 +413,60 @@ def log_to_mlflow(
 
 
 # ---------------------------------------------------------------------------
-# Step 6 — Baseline comparison
-# ---------------------------------------------------------------------------
-
-def compute_baseline(y_train: pd.Series, y_test: pd.Series) -> dict[str, float]:
-    """
-    Dumb baseline: predict the median training sale_price for every property.
-
-    This is the minimum bar the model must beat. If XGBoost can't outperform
-    'just guess the median', then our features are useless or something is broken.
-
-    R² of the baseline is always 0 or negative — the model should be much higher.
-    """
-    median_pred = float(y_train.median())
-    preds = np.full(len(y_test), median_pred)
-
-    rmse = float(np.sqrt(mean_squared_error(y_test, preds)))
-    mae  = float(mean_absolute_error(y_test, preds))
-    r2   = float(r2_score(y_test, preds))
-
-    print("\n" + "=" * 50)
-    print("BASELINE (predict training median for everything)")
-    print("=" * 50)
-    print(f"  Median prediction : ${median_pred:,.0f}")
-    print(f"  RMSE : ${rmse:>15,.0f}")
-    print(f"  MAE  : ${mae:>15,.0f}")
-    print(f"  R²   : {r2:>16.4f}")
-    print("=" * 50)
-
-    return {"baseline_rmse": rmse, "baseline_mae": mae, "baseline_r2": r2}
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     print("=" * 60)
-    print("LAYER 3+4 — MODEL TRAINING + MLFLOW TRACKING")
+    print("  LAYER 3+4 — OPTUNA TUNING + MLFLOW TRACKING")
+    print(f"  Optuna trials: {N_TRIALS}")
     print("=" * 60)
 
+    # Step 1 — Load data
     X_train, y_train, X_test, y_test = load_data()
 
-    # Step 0: baseline — sets the minimum bar for the model to beat
+    # Step 2 — Baseline
     baseline_metrics = compute_baseline(y_train, y_test)
 
-    model   = train_model(X_train, y_train)
+    # Step 3 — Find best hyperparameters with Optuna
+    y_train_log = np.log1p(y_train)
+    best_params = tune_hyperparameters(X_train, y_train_log, X_test, y_test)
+
+    # Step 4 — Train final model with best params
+    model = train_model(X_train, y_train, best_params)
+
+    # Step 5 — Evaluate
     metrics = evaluate_model(model, X_test, y_test)
+
+    # Step 6 — Feature importance
     print_feature_importance(model)
+
+    # Step 7 — Save locally
     save_model_locally(model)
 
+    # Step 8 — Log to MLflow
     try:
-        run_id = log_to_mlflow(model, metrics, X_train)
+        run_id = log_to_mlflow(model, best_params, metrics, X_train)
     except Exception as e:
         print(f"\nMLflow logging skipped ({type(e).__name__}: {e})")
         print("Model is saved locally. Start MLflow server and re-run to register.")
         run_id = "N/A (MLflow offline)"
 
-    # Summary: how much did we beat the baseline?
+    # Final summary
     rmse_lift = (baseline_metrics["baseline_rmse"] - metrics["rmse"]) / baseline_metrics["baseline_rmse"] * 100
     mae_lift  = (baseline_metrics["baseline_mae"]  - metrics["mae"])  / baseline_metrics["baseline_mae"]  * 100
 
     print("\n" + "=" * 60)
-    print("MODEL vs BASELINE SUMMARY")
+    print("  MODEL vs BASELINE SUMMARY")
     print("=" * 60)
     print(f"  RMSE  : model ${metrics['rmse']:>12,.0f}  vs  baseline ${baseline_metrics['baseline_rmse']:>12,.0f}  ({rmse_lift:+.1f}%)")
     print(f"  MAE   : model ${metrics['mae']:>12,.0f}  vs  baseline ${baseline_metrics['baseline_mae']:>12,.0f}  ({mae_lift:+.1f}%)")
     print(f"  R²    : model {metrics['r2']:>13.4f}  vs  baseline {baseline_metrics['baseline_r2']:>13.4f}")
     print("=" * 60)
-    print(f"\nMLflow UI : http://127.0.0.1:5000")
-    print(f"Experiment: {MLFLOW_EXPERIMENT}")
-    print(f"Run ID    : {run_id}")
-    print(f"Registry  : {MODEL_REGISTRY_NAME}  alias=@{PRODUCTION_ALIAS}")
-
+    print(f"\n  MLflow UI : {MLFLOW_TRACKING_URI}")
+    print(f"  Experiment: {MLFLOW_EXPERIMENT}")
+    print(f"  Run ID    : {run_id}")
+    print(f"  Registry  : {MODEL_REGISTRY_NAME}  alias=@{PRODUCTION_ALIAS}")
 
 
 if __name__ == "__main__":
